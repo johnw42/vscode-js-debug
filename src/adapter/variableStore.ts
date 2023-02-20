@@ -289,6 +289,15 @@ class VariableContext {
           ),
         ]);
       }
+    } else {
+      const { result } = await this.evaluateCodeForObject(
+        object,
+        'function() { return this[Symbol.debugView](); }',
+        [],
+      );
+      if (result) {
+        object = result;
+      }
     }
 
     if (!object.objectId) {
@@ -737,6 +746,17 @@ class ObjectVariable extends Variable implements IMemoryReadable {
       return this.customStringRepr;
     }
 
+    let remoteObject = this.remoteObject;
+    const debugViewResult = await this.context.cdp.Runtime.callFunctionOn({
+      objectId: remoteObject.objectId,
+      functionDeclaration: 'function() { return this[Symbol.debugView](); }',
+      returnByValue: false,
+      generatePreview: true,
+    });
+    if (debugViewResult && !debugViewResult.exceptionDetails) {
+      remoteObject = debugViewResult.result;
+    }
+
     // for the first level of evaluations, toString it on-demand
     if (!this.context.parent && this.customStringRepr !== NoCustomStringRepr) {
       try {
@@ -745,7 +765,7 @@ class ObjectVariable extends Variable implements IMemoryReadable {
             `${customStringReprMaxLength}`,
             this.context.customDescriptionGenerator || 'null',
           ),
-          objectId: this.remoteObject.objectId,
+          objectId: remoteObject.objectId,
           returnByValue: true,
         });
         if (ret?.result.value) {
@@ -758,8 +778,8 @@ class ObjectVariable extends Variable implements IMemoryReadable {
     }
 
     return (
-      (this.context.name === '__proto__' && this.remoteObject.description) ||
-      objectPreview.previewRemoteObject(this.remoteObject, previewContext)
+      (this.context.name === '__proto__' && remoteObject.description) ||
+      objectPreview.previewRemoteObject(remoteObject, previewContext)
     );
   }
 
