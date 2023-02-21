@@ -1,0 +1,6 @@
+{
+  "type": "commonjs",
+  "dependencies": {
+    "immutable": "^4.2.4"
+  }
+}

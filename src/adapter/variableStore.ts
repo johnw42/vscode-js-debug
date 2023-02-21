@@ -26,6 +26,8 @@ import { invokeGetter } from './templates/invokeGetter';
 import { readMemory } from './templates/readMemory';
 import { writeMemory } from './templates/writeMemory';
 
+const TRANSPARENT_DEBUG_PROXIES = true;
+
 const getVariableId = (() => {
   let last = 0;
   const max = 0x7fffffff - 1;
@@ -270,6 +272,7 @@ class VariableContext {
   ): Promise<Variable[]> {
     const properties: (Promise<Variable[]> | Variable[])[] = [];
 
+    let isDebugView = false;
     if (this.settings.customPropertiesGenerator) {
       const { result, errorDescription } = await this.evaluateCodeForObject(
         object,
@@ -290,13 +293,30 @@ class VariableContext {
         ]);
       }
     } else {
-      const { result } = await this.evaluateCodeForObject(
-        object,
-        'function() { return this[Symbol.debugView](); }',
-        [],
-      );
-      if (result) {
-        object = result;
+      const debugViewResult = await this.cdp.Runtime.callFunctionOn({
+        functionDeclaration:
+          'function() { return typeof this.__msft_debugView === "function" && this.__msft_debugView(); }',
+        objectId: object.objectId,
+        returnByValue: false,
+        generatePreview: true,
+      });
+      if (debugViewResult) {
+        const { result, exceptionDetails } = debugViewResult;
+        if (exceptionDetails) {
+          properties.push([
+            this.createVariable(
+              ErrorVariable,
+              { name: '', sortOrder: SortOrder.Error },
+              result as Cdp.Runtime.RemoteObject,
+              result?.description ||
+                exceptionDetails.exception?.description ||
+                l10n.t('Unknown error'),
+            ),
+          ]);
+        } else if (result.objectId) {
+          object = debugViewResult.result;
+          isDebugView = true;
+        }
       }
     }
 
@@ -335,6 +355,53 @@ class VariableContext {
         .catch(() => ({} as Record<string, string>)),
     ]);
     if (!accessorsProperties || !ownProperties) return [];
+
+    if (
+      TRANSPARENT_DEBUG_PROXIES &&
+      isDebugView &&
+      object.type === 'object' &&
+      object.subtype == 'proxy'
+    ) {
+      const result = await this.cdp.Runtime.callFunctionOn({
+        functionDeclaration: 'function() { return Object.getOwnPropertyNames(this); }',
+        objectId: object.objectId,
+        returnByValue: true,
+      });
+      if (result) {
+        const names = result.result.value as string[];
+        const values = new Map<string, unknown>();
+        for (const name of names) {
+          const valueResult = await this.cdp.Runtime.callFunctionOn({
+            functionDeclaration: 'function(prop) { return this[prop]; }',
+            arguments: [{ value: name }],
+            objectId: object.objectId,
+            returnByValue: false,
+            generatePreview: false,
+          });
+          if (valueResult) {
+            values.set(name, valueResult.result);
+            const stringResult = await this.cdp.Runtime.callFunctionOn({
+              functionDeclaration: 'function(prop) { return String(this[prop]); }',
+              arguments: [{ value: name }],
+              objectId: object.objectId,
+              returnByValue: true,
+            });
+            if (stringResult?.result?.type === 'string') {
+              stringyProps[name] = stringResult.result.value;
+            }
+          }
+        }
+        ownProperties.result = names.map(name => ({
+          name,
+          value: values.get(name) as Cdp.Runtime.RemoteObject | undefined,
+          configurable: true,
+          enumerable: true,
+          isOwn: true,
+        }));
+
+        ownProperties.internalProperties = [];
+      }
+    }
 
     // Merge own properties and all accessors.
     const propertiesMap = new Map<string, AnyPropertyDescriptor>();
@@ -749,7 +816,7 @@ class ObjectVariable extends Variable implements IMemoryReadable {
     let remoteObject = this.remoteObject;
     const debugViewResult = await this.context.cdp.Runtime.callFunctionOn({
       objectId: remoteObject.objectId,
-      functionDeclaration: 'function() { return this[Symbol.debugView](); }',
+      functionDeclaration: 'function() { return this.__msft_debugView(); }',
       returnByValue: false,
       generatePreview: true,
     });
